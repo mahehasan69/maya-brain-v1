@@ -6,4 +6,4 @@ compatibility_date = "2026-10-20"
 [[d1_databases]]
 binding = "DB"
 database_name = "maya-brain-v1-db"
-database_id = "REPLACE_WITH_YOUR_NEW_DATABASE_ID"
+database_id = "45f01775-0f1c-4b13-977a-b7167d34bbf4"
