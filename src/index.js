@@ -1,7 +1,7 @@
 
 import { generateReply } from "./reply.js";
 
-const ALLOWED_ORIGIN = "null";
+const ALLOWED_ORIGIN = "http://127.0.0.1:8000";
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin");
