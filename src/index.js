@@ -1,6 +1,9 @@
 
 import { generateReply } from "./reply.js";
-import { setHistoryEnabled } from "./memory.js";
+import {
+  setHistoryEnabled,
+  proposeMemory
+} from "./memory.js";
 
 const ALLOWED_ORIGIN = "http://127.0.0.1:8000";
 
@@ -58,14 +61,26 @@ export default {
     const path = url.pathname;
 
     if (origin && origin !== ALLOWED_ORIGIN) {
-      return jsonResponse({ error: "Origin not allowed" }, 403, request);
+      return jsonResponse(
+        { error: "Origin not allowed" },
+        403,
+        request
+      );
     }
 
-    const allowedPaths = ["/reply", "/settings/history"];
+    const allowedPaths = [
+      "/reply",
+      "/settings/history",
+      "/memory/test"
+    ];
 
     if (request.method === "OPTIONS" && allowedPaths.includes(path)) {
       if (origin !== ALLOWED_ORIGIN) {
-        return jsonResponse({ error: "Origin not allowed" }, 403, request);
+        return jsonResponse(
+          { error: "Origin not allowed" },
+          403,
+          request
+        );
       }
 
       return new Response(null, {
@@ -87,7 +102,11 @@ export default {
     }
 
     if (request.method !== "POST") {
-      return jsonResponse({ error: "Method not allowed" }, 405, request);
+      return jsonResponse(
+        { error: "Method not allowed" },
+        405,
+        request
+      );
     }
 
     if (!isAuthorized(request, env)) {
@@ -102,7 +121,7 @@ export default {
 
     const body = parsed.body ?? {};
 
-    // Consent-aware history settings endpoint.
+    // Update conversation-history preference.
     if (path === "/settings/history") {
       const { userId, enabled } = body;
 
@@ -136,18 +155,65 @@ export default {
           message === "User not initialized." ||
           message === "Current retention consent is required."
         ) {
-          return jsonResponse({
-            error: message
-          }, 400, request);
+          return jsonResponse({ error: message }, 400, request);
         }
 
-        return jsonResponse({
-          error: "Unable to update history settings"
-        }, 500, request);
+        return jsonResponse(
+          { error: "Unable to update history settings" },
+          500,
+          request
+        );
       }
     }
 
-    // Reply endpoint.
+    // Protected test for memory-disabled behavior.
+    if (path === "/memory/test") {
+      if (!env.DB) {
+        return jsonResponse(
+          { error: "Service configuration error" },
+          503,
+          request
+        );
+      }
+
+      const { userId, content } = body;
+
+      if (
+        typeof userId !== "string" ||
+        !userId.trim() ||
+        userId.length > 200 ||
+        typeof content !== "string" ||
+        !content.trim() ||
+        content.length > 1000
+      ) {
+        return jsonResponse({
+          error: "userId and content are required"
+        }, 400, request);
+      }
+
+      try {
+        const result = await proposeMemory(
+          env,
+          userId,
+          "preference",
+          content
+        );
+
+        return jsonResponse({
+          ok: true,
+          test: "memory-disabled-protection",
+          result
+        }, 200, request);
+      } catch {
+        return jsonResponse(
+          { error: "Memory test failed" },
+          500,
+          request
+        );
+      }
+    }
+
+    // Generate an AI reply.
     if (!env.DB) {
       return jsonResponse(
         { error: "Service configuration error" },
