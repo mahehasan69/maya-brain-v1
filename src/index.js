@@ -1,13 +1,35 @@
 
 import { generateReply } from "./reply.js";
 
-function jsonResponse(data, status = 200) {
+const ALLOWED_ORIGIN = "null";
+
+function corsHeaders(request) {
+  const origin = request.headers.get("Origin");
+  const headers = new Headers({
+    "Cache-Control": "no-store",
+    "Vary": "Origin"
+  });
+
+  if (origin === ALLOWED_ORIGIN) {
+    headers.set("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+    headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+    headers.set(
+      "Access-Control-Allow-Headers",
+      "Authorization, Content-Type"
+    );
+    headers.set("Access-Control-Max-Age", "600");
+  }
+
+  return headers;
+}
+
+function jsonResponse(data, status = 200, request) {
+  const headers = corsHeaders(request);
+  headers.set("Content-Type", "application/json; charset=utf-8");
+
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store"
-    }
+    headers
   });
 }
 
@@ -29,42 +51,64 @@ function isAuthorized(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const origin = request.headers.get("Origin");
 
-    // Public health check: never expose secrets or database details.
+    // Only allow browser requests from a local HTML file.
+    // Server-to-server requests without an Origin header remain supported.
+    if (origin && origin !== ALLOWED_ORIGIN) {
+      return jsonResponse(
+        { error: "Origin not allowed" },
+        403,
+        request
+      );
+    }
+
+    // Handle browser preflight before authentication.
+    if (request.method === "OPTIONS" && url.pathname === "/reply") {
+      if (origin !== ALLOWED_ORIGIN) {
+        return jsonResponse({ error: "Origin not allowed" }, 403, request);
+      }
+
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(request)
+      });
+    }
+
+    // Public health check.
     if (request.method === "GET" && url.pathname === "/health") {
       return jsonResponse({
         ok: true,
         service: "maya-brain-v1",
         status: "online"
-      });
+      }, 200, request);
     }
 
     if (url.pathname !== "/reply") {
-      return jsonResponse({ error: "Not found" }, 404);
+      return jsonResponse({ error: "Not found" }, 404, request);
     }
 
     if (request.method !== "POST") {
-      return jsonResponse(
-        { error: "Method not allowed" },
-        405
-      );
+      return jsonResponse({ error: "Method not allowed" }, 405, request);
     }
 
     if (!isAuthorized(request, env)) {
-      return jsonResponse({ error: "Unauthorized" }, 401);
+      return jsonResponse({ error: "Unauthorized" }, 401, request);
     }
 
     if (!env.DB) {
       return jsonResponse(
         { error: "Service configuration error" },
-        503
+        503,
+        request
       );
     }
 
     if (!env.GROQ_API_KEY) {
       return jsonResponse(
         { error: "AI provider is not configured" },
-        503
+        503,
+        request
       );
     }
 
@@ -73,7 +117,7 @@ export default {
     try {
       body = await request.json();
     } catch {
-      return jsonResponse({ error: "Invalid JSON body" }, 400);
+      return jsonResponse({ error: "Invalid JSON body" }, 400, request);
     }
 
     const { userId, conversationId, message } = body ?? {};
@@ -87,11 +131,9 @@ export default {
       !message.trim()
     ) {
       return jsonResponse(
-        {
-          error:
-            "userId, conversationId, and message are required"
-        },
-        400
+        { error: "userId, conversationId, and message are required" },
+        400,
+        request
       );
     }
 
@@ -102,7 +144,8 @@ export default {
     ) {
       return jsonResponse(
         { error: "Request exceeds an allowed size" },
-        413
+        413,
+        request
       );
     }
 
@@ -114,12 +157,12 @@ export default {
         message
       );
 
-      return jsonResponse({ ok: true, reply });
+      return jsonResponse({ ok: true, reply }, 200, request);
     } catch {
-      // Keep internal errors, SQL details, and provider diagnostics private.
       return jsonResponse(
         { error: "Unable to generate a reply right now" },
-        502
+        502,
+        request
       );
     }
   }
