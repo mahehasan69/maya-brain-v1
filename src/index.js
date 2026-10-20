@@ -1,4 +1,3 @@
-
 import { generateReply } from "./reply.js";
 import {
   setHistoryEnabled,
@@ -9,6 +8,10 @@ import {
 } from "./memory.js";
 
 const ALLOWED_ORIGIN = "http://127.0.0.1:8000";
+const MAX_USER_ID_LENGTH = 200;
+const MAX_CONVERSATION_ID_LENGTH = 200;
+const MAX_MESSAGE_LENGTH = 12000;
+const MAX_MEMORY_CONTENT_LENGTH = 1000;
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin");
@@ -34,11 +37,14 @@ function jsonResponse(data, status = 200, request) {
   const headers = corsHeaders(request);
   headers.set("Content-Type", "application/json; charset=utf-8");
 
-  return new Response(JSON.stringify(data), { status, headers });
+  return new Response(JSON.stringify(data), {
+    status,
+    headers
+  });
 }
 
 function isAuthorized(request, env) {
-  const secret = env.BRAIN_API_SECRET;
+  const secret = env?.BRAIN_API_SECRET;
   const authorization = request.headers.get("Authorization");
 
   return (
@@ -51,7 +57,10 @@ function isAuthorized(request, env) {
 
 async function readJson(request) {
   try {
-    return { ok: true, body: await request.json() };
+    return {
+      ok: true,
+      body: await request.json()
+    };
   } catch {
     return { ok: false };
   }
@@ -61,7 +70,27 @@ function validUserId(userId) {
   return (
     typeof userId === "string" &&
     userId.trim().length > 0 &&
-    userId.length <= 200
+    userId.length <= MAX_USER_ID_LENGTH
+  );
+}
+
+function validConversationId(conversationId) {
+  return (
+    typeof conversationId === "string" &&
+    conversationId.trim().length > 0 &&
+    conversationId.length <= MAX_CONVERSATION_ID_LENGTH
+  );
+}
+
+function databaseAvailable(env) {
+  return Boolean(env?.DB);
+}
+
+function memoryErrorResponse(request) {
+  return jsonResponse(
+    { error: "Unable to complete the memory operation" },
+    500,
+    request
   );
 }
 
@@ -71,6 +100,8 @@ export default {
     const origin = request.headers.get("Origin");
     const path = url.pathname;
 
+    // Restrict browser-origin requests to the local test page.
+    // Server-to-server requests without Origin remain supported.
     if (origin && origin !== ALLOWED_ORIGIN) {
       return jsonResponse(
         { error: "Origin not allowed" },
@@ -88,7 +119,10 @@ export default {
       "/memory/retrieve"
     ];
 
-    if (request.method === "OPTIONS" && allowedPaths.includes(path)) {
+    if (
+      request.method === "OPTIONS" &&
+      allowedPaths.includes(path)
+    ) {
       if (origin !== ALLOWED_ORIGIN) {
         return jsonResponse(
           { error: "Origin not allowed" },
@@ -112,7 +146,11 @@ export default {
     }
 
     if (!allowedPaths.includes(path)) {
-      return jsonResponse({ error: "Not found" }, 404, request);
+      return jsonResponse(
+        { error: "Not found" },
+        404,
+        request
+      );
     }
 
     if (request.method !== "POST") {
@@ -124,19 +162,35 @@ export default {
     }
 
     if (!isAuthorized(request, env)) {
-      return jsonResponse({ error: "Unauthorized" }, 401, request);
+      return jsonResponse(
+        { error: "Unauthorized" },
+        401,
+        request
+      );
     }
 
     const parsed = await readJson(request);
 
     if (!parsed.ok) {
-      return jsonResponse({ error: "Invalid JSON body" }, 400, request);
+      return jsonResponse(
+        { error: "Invalid JSON body" },
+        400,
+        request
+      );
     }
 
     const body = parsed.body ?? {};
 
-    // Conversation-history preference.
+    // Update conversation-history preference.
     if (path === "/settings/history") {
+      if (!databaseAvailable(env)) {
+        return jsonResponse(
+          { error: "Service configuration error" },
+          503,
+          request
+        );
+      }
+
       const { userId, enabled } = body;
 
       if (!validUserId(userId) || typeof enabled !== "boolean") {
@@ -146,7 +200,11 @@ export default {
       }
 
       try {
-        const settings = await setHistoryEnabled(env, userId, enabled);
+        const settings = await setHistoryEnabled(
+          env,
+          userId,
+          enabled
+        );
 
         return jsonResponse({
           ok: true,
@@ -154,23 +212,40 @@ export default {
           history_enabled: settings.history_enabled === 1
         }, 200, request);
       } catch (error) {
-        const message = error instanceof Error ? error.message : "";
+        const message =
+          error instanceof Error ? error.message : "";
 
-        const status = [
+        const expectedErrors = [
           "User not initialized.",
           "Current retention consent is required."
-        ].includes(message) ? 400 : 500;
+        ];
 
-        return jsonResponse({
-          error: status === 400
-            ? message
-            : "Unable to update history settings"
-        }, status, request);
+        if (expectedErrors.includes(message)) {
+          return jsonResponse(
+            { error: message },
+            400,
+            request
+          );
+        }
+
+        return jsonResponse(
+          { error: "Unable to update history settings" },
+          500,
+          request
+        );
       }
     }
 
     // Enable or disable long-term memory.
     if (path === "/memory/enable") {
+      if (!databaseAvailable(env)) {
+        return jsonResponse(
+          { error: "Service configuration error" },
+          503,
+          request
+        );
+      }
+
       const { userId, enabled } = body;
 
       if (!validUserId(userId) || typeof enabled !== "boolean") {
@@ -180,7 +255,11 @@ export default {
       }
 
       try {
-        const settings = await setMemoryEnabled(env, userId, enabled);
+        const settings = await setMemoryEnabled(
+          env,
+          userId,
+          enabled
+        );
 
         return jsonResponse({
           ok: true,
@@ -188,24 +267,45 @@ export default {
           memory_enabled: settings.memory_enabled === 1
         }, 200, request);
       } catch (error) {
-        const message = error instanceof Error ? error.message : "";
-        const status = message === "User not initialized." ? 400 : 400;
+        const message =
+          error instanceof Error ? error.message : "";
 
-        return jsonResponse({
-          error: message || "Unable to update memory settings"
-        }, status, request);
+        if (
+          message === "User not initialized." ||
+          message === "Current onboarding and retention consent are required."
+        ) {
+          return jsonResponse(
+            { error: message },
+            400,
+            request
+          );
+        }
+
+        return jsonResponse(
+          { error: "Unable to update memory settings" },
+          500,
+          request
+        );
       }
     }
 
-    // Protected test: propose a memory.
+    // Test whether a memory can be proposed under current consent.
     if (path === "/memory/test") {
+      if (!databaseAvailable(env)) {
+        return jsonResponse(
+          { error: "Service configuration error" },
+          503,
+          request
+        );
+      }
+
       const { userId, content } = body;
 
       if (
         !validUserId(userId) ||
         typeof content !== "string" ||
         !content.trim() ||
-        content.length > 1000
+        content.length > MAX_MEMORY_CONTENT_LENGTH
       ) {
         return jsonResponse({
           error: "Valid userId and content are required"
@@ -222,24 +322,31 @@ export default {
 
         return jsonResponse({
           ok: true,
-          test: "memory-disabled-protection",
+          test: "memory-consent-protection",
           result
         }, 200, request);
       } catch {
-        return jsonResponse({
-          error: "Memory test failed"
-        }, 500, request);
+        return memoryErrorResponse(request);
       }
     }
 
-    // Approve a pending memory for this user.
+    // Approve a pending memory belonging to the specified user.
     if (path === "/memory/approve") {
+      if (!databaseAvailable(env)) {
+        return jsonResponse(
+          { error: "Service configuration error" },
+          503,
+          request
+        );
+      }
+
       const { userId, memoryId } = body;
 
       if (
         !validUserId(userId) ||
         typeof memoryId !== "string" ||
-        !memoryId.trim()
+        !memoryId.trim() ||
+        memoryId.length > 200
       ) {
         return jsonResponse({
           error: "Valid userId and memoryId are required"
@@ -259,14 +366,20 @@ export default {
           result
         }, 200, request);
       } catch {
-        return jsonResponse({
-          error: "Unable to review memory"
-        }, 500, request);
+        return memoryErrorResponse(request);
       }
     }
 
-    // Retrieve approved, unexpired memories.
+    // Return only approved, unexpired memories allowed by consent.
     if (path === "/memory/retrieve") {
+      if (!databaseAvailable(env)) {
+        return jsonResponse(
+          { error: "Service configuration error" },
+          503,
+          request
+        );
+      }
+
       const { userId } = body;
 
       if (!validUserId(userId)) {
@@ -289,26 +402,32 @@ export default {
           memories
         }, 200, request);
       } catch {
-        return jsonResponse({
-          error: "Unable to retrieve memories"
-        }, 500, request);
+        return memoryErrorResponse(request);
       }
     }
 
-    // Generate an AI reply.
-    if (!env.DB || !env.GROQ_API_KEY) {
-      return jsonResponse({
-        error: "Service configuration error"
-      }, 503, request);
+    // Generate a reply and persist messages according to consent.
+    if (!databaseAvailable(env)) {
+      return jsonResponse(
+        { error: "Service configuration error" },
+        503,
+        request
+      );
+    }
+
+    if (!env.GROQ_API_KEY) {
+      return jsonResponse(
+        { error: "AI provider is not configured" },
+        503,
+        request
+      );
     }
 
     const { userId, conversationId, message } = body;
 
     if (
       !validUserId(userId) ||
-      typeof conversationId !== "string" ||
-      !conversationId.trim() ||
-      conversationId.length > 200 ||
+      !validConversationId(conversationId) ||
       typeof message !== "string" ||
       !message.trim()
     ) {
@@ -317,7 +436,7 @@ export default {
       }, 400, request);
     }
 
-    if (message.length > 12000) {
+    if (message.length > MAX_MESSAGE_LENGTH) {
       return jsonResponse({
         error: "Message exceeds the 12000-character limit"
       }, 413, request);
@@ -331,11 +450,16 @@ export default {
         message
       );
 
-      return jsonResponse({ ok: true, reply }, 200, request);
-    } catch {
       return jsonResponse({
-        error: "Unable to generate a reply right now"
-      }, 502, request);
+        ok: true,
+        reply
+      }, 200, request);
+    } catch {
+      return jsonResponse(
+        { error: "Unable to generate a reply right now" },
+        502,
+        request
+      );
     }
   }
 };
