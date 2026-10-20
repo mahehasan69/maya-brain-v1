@@ -1,0 +1,9 @@
+
+name = "maya-brain-v1"
+main = "src/index.js"
+compatibility_date = "2026-10-20"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "maya-brain-v1-db"
+database_id = "REPLACE_WITH_YOUR_NEW_DATABASE_ID"
