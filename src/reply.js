@@ -31,7 +31,8 @@ export async function generateReply(
   env,
   userId,
   conversationId,
-  message
+  message,
+  options = {}
 ) {
   validateInput(userId, conversationId, message);
 
@@ -39,9 +40,14 @@ export async function generateReply(
     throw new Error("Reply module: GROQ_API_KEY is missing.");
   }
 
+  const fetchImpl = options.fetchImpl ?? fetch;
+
+  if (typeof fetchImpl !== "function") {
+    throw new Error("A valid fetch implementation is required.");
+  }
+
   const model = env.GROQ_MODEL || DEFAULT_MODEL;
 
-  // Load only context permitted by the user's privacy settings.
   const context = await buildContext(
     env,
     userId,
@@ -84,7 +90,7 @@ ${JSON.stringify(message)}
   let response;
 
   try {
-    response = await fetch(
+    response = await fetchImpl(
       "https://api.groq.com/openai/v1/chat/completions",
       {
         method: "POST",
@@ -114,8 +120,6 @@ ${JSON.stringify(message)}
   }
 
   if (!response.ok) {
-    // Avoid returning provider response bodies, which may contain
-    // diagnostic details, to the end user.
     throw new Error(
       `AI provider request failed (HTTP ${response.status}).`
     );
