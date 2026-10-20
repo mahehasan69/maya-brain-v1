@@ -11,7 +11,7 @@ const ALLOWED_MEMORY_CATEGORIES = [
 
 function requireDB(env) {
   if (!env?.DB) {
-    throw new Error("Database binding is missing.");
+    throw new Error("DB binding is missing");
   }
   return env.DB;
 }
@@ -22,7 +22,7 @@ function validateUserId(userId) {
     !userId.trim() ||
     userId.length > 200
   ) {
-    throw new Error("A valid user ID is required.");
+    throw new Error("A valid internal user ID is required");
   }
 }
 
@@ -80,10 +80,6 @@ export async function initializeUser(env, userId) {
   return ensureUser(requireDB(env), userId);
 }
 
-/**
- * Record the user's separate retention and training choices.
- * History and long-term memory remain disabled until enabled separately.
- */
 export async function recordConsent(
   env,
   userId,
