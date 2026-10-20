@@ -75,6 +75,54 @@ export async function initializeUser(env, userId) {
   return ensureUser(db, userId);
 }
 
+/**
+ * Records explicit onboarding choices.
+ * History and long-term memory remain disabled by default.
+ * Training consent is independent of retention consent.
+ */
+export async function recordConsent(
+  env,
+  userId,
+  retentionConsent,
+  trainingConsent
+) {
+  validateUserId(userId);
+  validateBoolean(retentionConsent, "Retention consent");
+  validateBoolean(trainingConsent, "Training consent");
+
+  const db = requireDB(env);
+  await ensureUser(db, userId);
+
+  const now = new Date().toISOString();
+
+  await db.prepare(`
+    UPDATE user_settings
+    SET retention_consent = ?,
+        training_consent = ?,
+        privacy_notice_version = '1.0',
+        retention_choice_at = ?,
+        training_choice_at = ?,
+        retention_consent_at = ?,
+        training_consent_at = ?,
+        consent_updated_at = ?,
+        memory_enabled = 0,
+        history_enabled = 0,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = ?
+  `).bind(
+    retentionConsent ? 1 : 0,
+    trainingConsent ? 1 : 0,
+    now,
+    now,
+    now,
+    now,
+    now,
+    userId
+  ).run();
+
+  return getSettingsRow(db, userId);
+}
+
 export async function setMemoryEnabled(env, userId, enabled) {
   validateUserId(userId);
   validateBoolean(enabled, "Memory preference");
@@ -89,10 +137,7 @@ export async function setMemoryEnabled(env, userId, enabled) {
   if (enabled) {
     const permission = await requireRetentionConsent(db, userId);
 
-    if (
-      !permission.allowed ||
-      permission.row?.retention_consent !== 1
-    ) {
+    if (!permission.allowed) {
       throw new Error(
         "Current onboarding and retention consent are required."
       );
@@ -194,7 +239,6 @@ export async function saveMessage(
     };
   }
 
-  // Never save conversation messages when history is disabled.
   if (permission.row.history_enabled !== 1) {
     return {
       saved: false,
@@ -229,7 +273,6 @@ export async function proposeMemory(
 ) {
   validateUserId(userId);
 
-  // Validate category before accessing the database.
   if (
     typeof category !== "string" ||
     !ALLOWED_MEMORY_CATEGORIES.includes(category)
@@ -245,7 +288,9 @@ export async function proposeMemory(
     sourceMessageId !== null &&
     (!Number.isInteger(sourceMessageId) || sourceMessageId < 1)
   ) {
-    throw new Error("Source message ID must be a positive integer or null.");
+    throw new Error(
+      "Source message ID must be a positive integer or null."
+    );
   }
 
   const db = requireDB(env);
