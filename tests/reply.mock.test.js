@@ -156,3 +156,41 @@ test("handles an empty AI response", async () => {
     db.close();
   }
 });
+
+test("diagnostic: injected fetch is actually called", async () => {
+  const db = makeTestEnv();
+
+  try {
+    const conversation = await createConversation(db.env);
+    let mockCalled = false;
+
+    const fetchImpl = async () => {
+      mockCalled = true;
+
+      return new Response(
+        JSON.stringify({
+          choices: [
+            { message: { content: "Mock reply" } }
+          ]
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        }
+      );
+    };
+
+    const reply = await generateReply(
+      { ...db.env, GROQ_API_KEY: "test-key" },
+      "user-a",
+      conversation,
+      "Hello Maya",
+      { fetchImpl }
+    );
+
+    assert.equal(mockCalled, true);
+    assert.equal(reply, "Mock reply");
+  } finally {
+    db.close();
+  }
+});
