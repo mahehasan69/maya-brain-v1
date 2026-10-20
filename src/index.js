@@ -1,5 +1,6 @@
 
 import { generateReply } from "./reply.js";
+import { setHistoryEnabled } from "./memory.js";
 
 const ALLOWED_ORIGIN = "http://127.0.0.1:8000";
 
@@ -27,44 +28,42 @@ function jsonResponse(data, status = 200, request) {
   const headers = corsHeaders(request);
   headers.set("Content-Type", "application/json; charset=utf-8");
 
-  return new Response(JSON.stringify(data), {
-    status,
-    headers
-  });
+  return new Response(JSON.stringify(data), { status, headers });
 }
 
 function isAuthorized(request, env) {
   const secret = env.BRAIN_API_SECRET;
   const authorization = request.headers.get("Authorization");
 
-  if (
-    typeof secret !== "string" ||
-    secret.length < 32 ||
-    typeof authorization !== "string"
-  ) {
-    return false;
-  }
+  return (
+    typeof secret === "string" &&
+    secret.length >= 32 &&
+    typeof authorization === "string" &&
+    authorization === `Bearer ${secret}`
+  );
+}
 
-  return authorization === `Bearer ${secret}`;
+async function readJson(request) {
+  try {
+    return { ok: true, body: await request.json() };
+  } catch {
+    return { ok: false };
+  }
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin");
+    const path = url.pathname;
 
-    // Only allow browser requests from a local HTML file.
-    // Server-to-server requests without an Origin header remain supported.
     if (origin && origin !== ALLOWED_ORIGIN) {
-      return jsonResponse(
-        { error: "Origin not allowed" },
-        403,
-        request
-      );
+      return jsonResponse({ error: "Origin not allowed" }, 403, request);
     }
 
-    // Handle browser preflight before authentication.
-    if (request.method === "OPTIONS" && url.pathname === "/reply") {
+    const allowedPaths = ["/reply", "/settings/history"];
+
+    if (request.method === "OPTIONS" && allowedPaths.includes(path)) {
       if (origin !== ALLOWED_ORIGIN) {
         return jsonResponse({ error: "Origin not allowed" }, 403, request);
       }
@@ -75,8 +74,7 @@ export default {
       });
     }
 
-    // Public health check.
-    if (request.method === "GET" && url.pathname === "/health") {
+    if (request.method === "GET" && path === "/health") {
       return jsonResponse({
         ok: true,
         service: "maya-brain-v1",
@@ -84,7 +82,7 @@ export default {
       }, 200, request);
     }
 
-    if (url.pathname !== "/reply") {
+    if (!allowedPaths.includes(path)) {
       return jsonResponse({ error: "Not found" }, 404, request);
     }
 
@@ -96,6 +94,60 @@ export default {
       return jsonResponse({ error: "Unauthorized" }, 401, request);
     }
 
+    const parsed = await readJson(request);
+
+    if (!parsed.ok) {
+      return jsonResponse({ error: "Invalid JSON body" }, 400, request);
+    }
+
+    const body = parsed.body ?? {};
+
+    // Consent-aware history settings endpoint.
+    if (path === "/settings/history") {
+      const { userId, enabled } = body;
+
+      if (
+        typeof userId !== "string" ||
+        !userId.trim() ||
+        userId.length > 200 ||
+        typeof enabled !== "boolean"
+      ) {
+        return jsonResponse({
+          error: "userId and boolean enabled are required"
+        }, 400, request);
+      }
+
+      try {
+        const settings = await setHistoryEnabled(
+          env,
+          userId,
+          enabled
+        );
+
+        return jsonResponse({
+          ok: true,
+          userId,
+          history_enabled: settings.history_enabled === 1
+        }, 200, request);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+
+        if (
+          message === "User not initialized." ||
+          message === "Current retention consent is required."
+        ) {
+          return jsonResponse({
+            error: message
+          }, 400, request);
+        }
+
+        return jsonResponse({
+          error: "Unable to update history settings"
+        }, 500, request);
+      }
+    }
+
+    // Reply endpoint.
     if (!env.DB) {
       return jsonResponse(
         { error: "Service configuration error" },
@@ -112,15 +164,7 @@ export default {
       );
     }
 
-    let body;
-
-    try {
-      body = await request.json();
-    } catch {
-      return jsonResponse({ error: "Invalid JSON body" }, 400, request);
-    }
-
-    const { userId, conversationId, message } = body ?? {};
+    const { userId, conversationId, message } = body;
 
     if (
       typeof userId !== "string" ||
@@ -130,11 +174,9 @@ export default {
       typeof message !== "string" ||
       !message.trim()
     ) {
-      return jsonResponse(
-        { error: "userId, conversationId, and message are required" },
-        400,
-        request
-      );
+      return jsonResponse({
+        error: "userId, conversationId, and message are required"
+      }, 400, request);
     }
 
     if (
