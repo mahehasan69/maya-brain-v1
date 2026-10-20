@@ -1,5 +1,9 @@
+
 import { generateReply } from "./reply.js";
 import {
+  initializeUser,
+  recordConsent,
+  startConversation,
   setHistoryEnabled,
   setMemoryEnabled,
   proposeMemory,
@@ -50,7 +54,6 @@ function isAuthorized(request, env) {
   return (
     typeof secret === "string" &&
     secret.length >= 32 &&
-    typeof authorization === "string" &&
     authorization === `Bearer ${secret}`
   );
 }
@@ -100,41 +103,10 @@ export default {
     const origin = request.headers.get("Origin");
     const path = url.pathname;
 
-    // Restrict browser-origin requests to the local test page.
-    // Server-to-server requests without Origin remain supported.
+    // Allow only the configured local browser tester.
+    // Server-to-server calls without an Origin are supported.
     if (origin && origin !== ALLOWED_ORIGIN) {
-      return jsonResponse(
-        { error: "Origin not allowed" },
-        403,
-        request
-      );
-    }
-
-    const allowedPaths = [
-      "/reply",
-      "/settings/history",
-      "/memory/test",
-      "/memory/enable",
-      "/memory/approve",
-      "/memory/retrieve"
-    ];
-
-    if (
-      request.method === "OPTIONS" &&
-      allowedPaths.includes(path)
-    ) {
-      if (origin !== ALLOWED_ORIGIN) {
-        return jsonResponse(
-          { error: "Origin not allowed" },
-          403,
-          request
-        );
-      }
-
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders(request)
-      });
+      return jsonResponse({ error: "Origin not allowed" }, 403, request);
     }
 
     if (request.method === "GET" && path === "/health") {
@@ -145,52 +117,110 @@ export default {
       }, 200, request);
     }
 
+    const allowedPaths = [
+      "/onboarding",
+      "/reply",
+      "/settings/history",
+      "/memory/test",
+      "/memory/enable",
+      "/memory/approve",
+      "/memory/retrieve"
+    ];
+
     if (!allowedPaths.includes(path)) {
-      return jsonResponse(
-        { error: "Not found" },
-        404,
-        request
-      );
+      return jsonResponse({ error: "Not found" }, 404, request);
+    }
+
+    if (request.method === "OPTIONS") {
+      if (origin !== ALLOWED_ORIGIN) {
+        return jsonResponse({ error: "Origin not allowed" }, 403, request);
+      }
+
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(request)
+      });
     }
 
     if (request.method !== "POST") {
-      return jsonResponse(
-        { error: "Method not allowed" },
-        405,
-        request
-      );
+      return jsonResponse({ error: "Method not allowed" }, 405, request);
     }
 
     if (!isAuthorized(request, env)) {
-      return jsonResponse(
-        { error: "Unauthorized" },
-        401,
-        request
-      );
+      return jsonResponse({ error: "Unauthorized" }, 401, request);
     }
 
     const parsed = await readJson(request);
 
     if (!parsed.ok) {
-      return jsonResponse(
-        { error: "Invalid JSON body" },
-        400,
-        request
-      );
+      return jsonResponse({ error: "Invalid JSON body" }, 400, request);
     }
 
     const body = parsed.body ?? {};
 
-    // Update conversation-history preference.
-    if (path === "/settings/history") {
-      if (!databaseAvailable(env)) {
+    if (!databaseAvailable(env)) {
+      return jsonResponse(
+        { error: "Service configuration error" },
+        503,
+        request
+      );
+    }
+
+    // Explicit onboarding choices and conversation initialization.
+    if (path === "/onboarding") {
+      const { userId, retentionConsent, trainingConsent } = body;
+
+      if (
+        !validUserId(userId) ||
+        typeof retentionConsent !== "boolean" ||
+        typeof trainingConsent !== "boolean"
+      ) {
+        return jsonResponse({
+          error:
+            "userId, boolean retentionConsent, and boolean trainingConsent are required"
+        }, 400, request);
+      }
+
+      try {
+        await initializeUser(env, userId);
+
+        const settings = await recordConsent(
+          env,
+          userId,
+          retentionConsent,
+          trainingConsent
+        );
+
+        let conversationId = null;
+
+        if (retentionConsent) {
+          conversationId = await startConversation(env, userId);
+
+          if (!conversationId) {
+            return jsonResponse({
+              error: "Consent saved, but conversation setup failed"
+            }, 500, request);
+          }
+        }
+
+        return jsonResponse({
+          ok: true,
+          userId,
+          retentionConsent: settings.retention_consent === 1,
+          trainingConsent: settings.training_consent === 1,
+          conversationId
+        }, 200, request);
+      } catch {
         return jsonResponse(
-          { error: "Service configuration error" },
-          503,
+          { error: "Unable to complete onboarding" },
+          500,
           request
         );
       }
+    }
 
+    // Update conversation history setting.
+    if (path === "/settings/history") {
       const { userId, enabled } = body;
 
       if (!validUserId(userId) || typeof enabled !== "boolean") {
@@ -200,11 +230,7 @@ export default {
       }
 
       try {
-        const settings = await setHistoryEnabled(
-          env,
-          userId,
-          enabled
-        );
+        const settings = await setHistoryEnabled(env, userId, enabled);
 
         return jsonResponse({
           ok: true,
@@ -212,20 +238,13 @@ export default {
           history_enabled: settings.history_enabled === 1
         }, 200, request);
       } catch (error) {
-        const message =
-          error instanceof Error ? error.message : "";
+        const message = error instanceof Error ? error.message : "";
 
-        const expectedErrors = [
-          "User not initialized.",
-          "Current retention consent is required."
-        ];
-
-        if (expectedErrors.includes(message)) {
-          return jsonResponse(
-            { error: message },
-            400,
-            request
-          );
+        if (
+          message === "User not initialized." ||
+          message === "Current retention consent is required."
+        ) {
+          return jsonResponse({ error: message }, 400, request);
         }
 
         return jsonResponse(
@@ -238,14 +257,6 @@ export default {
 
     // Enable or disable long-term memory.
     if (path === "/memory/enable") {
-      if (!databaseAvailable(env)) {
-        return jsonResponse(
-          { error: "Service configuration error" },
-          503,
-          request
-        );
-      }
-
       const { userId, enabled } = body;
 
       if (!validUserId(userId) || typeof enabled !== "boolean") {
@@ -255,11 +266,7 @@ export default {
       }
 
       try {
-        const settings = await setMemoryEnabled(
-          env,
-          userId,
-          enabled
-        );
+        const settings = await setMemoryEnabled(env, userId, enabled);
 
         return jsonResponse({
           ok: true,
@@ -267,18 +274,13 @@ export default {
           memory_enabled: settings.memory_enabled === 1
         }, 200, request);
       } catch (error) {
-        const message =
-          error instanceof Error ? error.message : "";
+        const message = error instanceof Error ? error.message : "";
 
         if (
           message === "User not initialized." ||
           message === "Current onboarding and retention consent are required."
         ) {
-          return jsonResponse(
-            { error: message },
-            400,
-            request
-          );
+          return jsonResponse({ error: message }, 400, request);
         }
 
         return jsonResponse(
@@ -289,16 +291,8 @@ export default {
       }
     }
 
-    // Test whether a memory can be proposed under current consent.
+    // Test the memory consent safeguards.
     if (path === "/memory/test") {
-      if (!databaseAvailable(env)) {
-        return jsonResponse(
-          { error: "Service configuration error" },
-          503,
-          request
-        );
-      }
-
       const { userId, content } = body;
 
       if (
@@ -308,7 +302,7 @@ export default {
         content.length > MAX_MEMORY_CONTENT_LENGTH
       ) {
         return jsonResponse({
-          error: "Valid userId and content are required"
+          error: "Valid userId and content (maximum 1000 characters) are required"
         }, 400, request);
       }
 
@@ -330,16 +324,8 @@ export default {
       }
     }
 
-    // Approve a pending memory belonging to the specified user.
+    // Approve a pending memory for the specified user.
     if (path === "/memory/approve") {
-      if (!databaseAvailable(env)) {
-        return jsonResponse(
-          { error: "Service configuration error" },
-          503,
-          request
-        );
-      }
-
       const { userId, memoryId } = body;
 
       if (
@@ -361,25 +347,14 @@ export default {
           true
         );
 
-        return jsonResponse({
-          ok: true,
-          result
-        }, 200, request);
+        return jsonResponse({ ok: true, result }, 200, request);
       } catch {
         return memoryErrorResponse(request);
       }
     }
 
-    // Return only approved, unexpired memories allowed by consent.
+    // Retrieve approved, unexpired memories.
     if (path === "/memory/retrieve") {
-      if (!databaseAvailable(env)) {
-        return jsonResponse(
-          { error: "Service configuration error" },
-          503,
-          request
-        );
-      }
-
       const { userId } = body;
 
       if (!validUserId(userId)) {
@@ -406,15 +381,7 @@ export default {
       }
     }
 
-    // Generate a reply and persist messages according to consent.
-    if (!databaseAvailable(env)) {
-      return jsonResponse(
-        { error: "Service configuration error" },
-        503,
-        request
-      );
-    }
-
+    // Generate a reply.
     if (!env.GROQ_API_KEY) {
       return jsonResponse(
         { error: "AI provider is not configured" },
@@ -450,10 +417,7 @@ export default {
         message
       );
 
-      return jsonResponse({
-        ok: true,
-        reply
-      }, 200, request);
+      return jsonResponse({ ok: true, reply }, 200, request);
     } catch {
       return jsonResponse(
         { error: "Unable to generate a reply right now" },
