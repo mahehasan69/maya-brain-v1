@@ -2,7 +2,10 @@
 import { generateReply } from "./reply.js";
 import {
   setHistoryEnabled,
-  proposeMemory
+  setMemoryEnabled,
+  proposeMemory,
+  reviewMemory,
+  retrieveMemories
 } from "./memory.js";
 
 const ALLOWED_ORIGIN = "http://127.0.0.1:8000";
@@ -54,6 +57,14 @@ async function readJson(request) {
   }
 }
 
+function validUserId(userId) {
+  return (
+    typeof userId === "string" &&
+    userId.trim().length > 0 &&
+    userId.length <= 200
+  );
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -71,7 +82,10 @@ export default {
     const allowedPaths = [
       "/reply",
       "/settings/history",
-      "/memory/test"
+      "/memory/test",
+      "/memory/enable",
+      "/memory/approve",
+      "/memory/retrieve"
     ];
 
     if (request.method === "OPTIONS" && allowedPaths.includes(path)) {
@@ -121,27 +135,18 @@ export default {
 
     const body = parsed.body ?? {};
 
-    // Update conversation-history preference.
+    // Conversation-history preference.
     if (path === "/settings/history") {
       const { userId, enabled } = body;
 
-      if (
-        typeof userId !== "string" ||
-        !userId.trim() ||
-        userId.length > 200 ||
-        typeof enabled !== "boolean"
-      ) {
+      if (!validUserId(userId) || typeof enabled !== "boolean") {
         return jsonResponse({
           error: "userId and boolean enabled are required"
         }, 400, request);
       }
 
       try {
-        const settings = await setHistoryEnabled(
-          env,
-          userId,
-          enabled
-        );
+        const settings = await setHistoryEnabled(env, userId, enabled);
 
         return jsonResponse({
           ok: true,
@@ -151,43 +156,59 @@ export default {
       } catch (error) {
         const message = error instanceof Error ? error.message : "";
 
-        if (
-          message === "User not initialized." ||
-          message === "Current retention consent is required."
-        ) {
-          return jsonResponse({ error: message }, 400, request);
-        }
+        const status = [
+          "User not initialized.",
+          "Current retention consent is required."
+        ].includes(message) ? 400 : 500;
 
-        return jsonResponse(
-          { error: "Unable to update history settings" },
-          500,
-          request
-        );
+        return jsonResponse({
+          error: status === 400
+            ? message
+            : "Unable to update history settings"
+        }, status, request);
       }
     }
 
-    // Protected test for memory-disabled behavior.
-    if (path === "/memory/test") {
-      if (!env.DB) {
-        return jsonResponse(
-          { error: "Service configuration error" },
-          503,
-          request
-        );
+    // Enable or disable long-term memory.
+    if (path === "/memory/enable") {
+      const { userId, enabled } = body;
+
+      if (!validUserId(userId) || typeof enabled !== "boolean") {
+        return jsonResponse({
+          error: "userId and boolean enabled are required"
+        }, 400, request);
       }
 
+      try {
+        const settings = await setMemoryEnabled(env, userId, enabled);
+
+        return jsonResponse({
+          ok: true,
+          userId,
+          memory_enabled: settings.memory_enabled === 1
+        }, 200, request);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        const status = message === "User not initialized." ? 400 : 400;
+
+        return jsonResponse({
+          error: message || "Unable to update memory settings"
+        }, status, request);
+      }
+    }
+
+    // Protected test: propose a memory.
+    if (path === "/memory/test") {
       const { userId, content } = body;
 
       if (
-        typeof userId !== "string" ||
-        !userId.trim() ||
-        userId.length > 200 ||
+        !validUserId(userId) ||
         typeof content !== "string" ||
         !content.trim() ||
         content.length > 1000
       ) {
         return jsonResponse({
-          error: "userId and content are required"
+          error: "Valid userId and content are required"
         }, 400, request);
       }
 
@@ -205,56 +226,101 @@ export default {
           result
         }, 200, request);
       } catch {
-        return jsonResponse(
-          { error: "Memory test failed" },
-          500,
-          request
+        return jsonResponse({
+          error: "Memory test failed"
+        }, 500, request);
+      }
+    }
+
+    // Approve a pending memory for this user.
+    if (path === "/memory/approve") {
+      const { userId, memoryId } = body;
+
+      if (
+        !validUserId(userId) ||
+        typeof memoryId !== "string" ||
+        !memoryId.trim()
+      ) {
+        return jsonResponse({
+          error: "Valid userId and memoryId are required"
+        }, 400, request);
+      }
+
+      try {
+        const result = await reviewMemory(
+          env,
+          userId,
+          memoryId,
+          true
         );
+
+        return jsonResponse({
+          ok: true,
+          result
+        }, 200, request);
+      } catch {
+        return jsonResponse({
+          error: "Unable to review memory"
+        }, 500, request);
+      }
+    }
+
+    // Retrieve approved, unexpired memories.
+    if (path === "/memory/retrieve") {
+      const { userId } = body;
+
+      if (!validUserId(userId)) {
+        return jsonResponse({
+          error: "A valid userId is required"
+        }, 400, request);
+      }
+
+      try {
+        const memories = await retrieveMemories(
+          env,
+          userId,
+          null,
+          10
+        );
+
+        return jsonResponse({
+          ok: true,
+          count: memories.length,
+          memories
+        }, 200, request);
+      } catch {
+        return jsonResponse({
+          error: "Unable to retrieve memories"
+        }, 500, request);
       }
     }
 
     // Generate an AI reply.
-    if (!env.DB) {
-      return jsonResponse(
-        { error: "Service configuration error" },
-        503,
-        request
-      );
-    }
-
-    if (!env.GROQ_API_KEY) {
-      return jsonResponse(
-        { error: "AI provider is not configured" },
-        503,
-        request
-      );
+    if (!env.DB || !env.GROQ_API_KEY) {
+      return jsonResponse({
+        error: "Service configuration error"
+      }, 503, request);
     }
 
     const { userId, conversationId, message } = body;
 
     if (
-      typeof userId !== "string" ||
-      !userId.trim() ||
+      !validUserId(userId) ||
       typeof conversationId !== "string" ||
       !conversationId.trim() ||
+      conversationId.length > 200 ||
       typeof message !== "string" ||
       !message.trim()
     ) {
       return jsonResponse({
-        error: "userId, conversationId, and message are required"
+        error: "Valid userId, conversationId, and message are required"
       }, 400, request);
     }
 
-    if (
-      userId.length > 200 ||
-      conversationId.length > 200 ||
-      message.length > 12000
-    ) {
-      return jsonResponse(
-        { error: "Request exceeds an allowed size" },
-        413,
-        request
-      );
+    if (message.length > 12000) {
+      return jsonResponse({
+        error: "Message exceeds the 12000-character limit"
+      }, 413, request);
     }
 
     try {
@@ -267,11 +333,9 @@ export default {
 
       return jsonResponse({ ok: true, reply }, 200, request);
     } catch {
-      return jsonResponse(
-        { error: "Unable to generate a reply right now" },
-        502,
-        request
-      );
+      return jsonResponse({
+        error: "Unable to generate a reply right now"
+      }, 502, request);
     }
   }
 };
