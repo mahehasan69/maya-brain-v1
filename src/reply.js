@@ -1,5 +1,7 @@
 
+
 import { buildContext } from "./context.js";
+import { saveMessage } from "./memory.js";
 
 const DEFAULT_MODEL = "openai/gpt-oss-120b";
 const MAX_MESSAGE_LENGTH = 12000;
@@ -49,6 +51,7 @@ export async function generateReply(
   }
 
   const model = env.GROQ_MODEL || DEFAULT_MODEL;
+
   const context = await buildContext(
     env,
     userId,
@@ -90,14 +93,8 @@ RESPONSE STYLE
   const requestBody = {
     model,
     messages: [
-      {
-        role: "system",
-        content: systemPrompt
-      },
-      {
-        role: "user",
-        content: userPrompt
-      }
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
     ],
     temperature: 0.7,
     max_tokens: 700
@@ -144,5 +141,26 @@ RESPONSE STYLE
     throw new Error("AI provider returned an empty reply.");
   }
 
-  return reply.trim();
+  const cleanReply = reply.trim();
+
+  // Persist only after successful generation.
+  // saveMessage enforces retention consent and history_enabled.
+  // If history is disabled, neither message is stored.
+  const userSave = await saveMessage(
+    env,
+    userId,
+    conversationId,
+    "user",
+    message
+  );
+
+  const assistantSave = await saveMessage(
+    env,
+    userId,
+    conversationId,
+    "assistant",
+    cleanReply
+  );
+
+  return cleanReply;
 }
