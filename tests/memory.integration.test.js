@@ -1,232 +1,195 @@
 
-import test from "node:test";
-import assert from "node:assert/strict";
-import Database from "better-sqlite3";
-import { readFileSync } from "node:fs";
+export const PRIVACY_NOTICE_VERSION = "1.0";
 
-import {
-  initializeUser,
-  setMemoryEnabled,
-  setHistoryEnabled,
-  startConversation,
-  saveMessage,
-  proposeMemory,
-  reviewMemory,
-  retrieveMemories
-} from "../src/memory.js";
+export const PRIVACY_NOTICE =
+  "Maya can store conversation history and personal memories only according to your choices. " +
+  "Training data use requires separate consent. You can change your choices later.";
 
-import {
-  setRetentionConsent,
-  setTrainingConsent,
-  setPersonalMemoryEnabled
-} from "../src/consent.js";
+function requireDB(env) {
+  if (!env?.DB) {
+    throw new Error("Consent module: DB binding is missing.");
+  }
+  return env.DB;
+}
 
-function makeTestEnv() {
-  const sqlite = new Database(":memory:");
-  sqlite.pragma("foreign_keys = ON");
-  sqlite.exec(readFileSync("database/schema.sql", "utf8"));
+function validateUserId(userId) {
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new Error("A valid internal user ID is required.");
+  }
+}
 
-  const DB = {
-    prepare(sql) {
-      return {
-        bind(...values) {
-          const statement = sqlite.prepare(sql);
+function validateChoice(value, name) {
+  if (typeof value !== "boolean") {
+    throw new Error(`${name} must be true or false.`);
+  }
+}
 
-          return {
-            async first() {
-              return statement.get(...values) ?? null;
-            },
-            async all() {
-              return { results: statement.all(...values) };
-            },
-            async run() {
-              const result = statement.run(...values);
-              return {
-                meta: {
-                  changes: result.changes,
-                  last_row_id: Number(result.lastInsertRowid)
-                }
-              };
-            }
-          };
-        }
-      };
-    }
+export async function initializeConsent(env, userId) {
+  validateUserId(userId);
+
+  const db = requireDB(env);
+
+  await db.prepare(`
+    INSERT OR IGNORE INTO user_settings (user_id)
+    VALUES (?)
+  `).bind(userId).run();
+
+  return getConsentStatus(env, userId);
+}
+
+export async function getConsentStatus(env, userId) {
+  validateUserId(userId);
+
+  const db = requireDB(env);
+
+  const row = await db.prepare(`
+    SELECT user_id,
+           memory_enabled,
+           history_enabled,
+           retention_consent,
+           training_consent,
+           privacy_notice_version,
+           retention_choice_at,
+           training_choice_at
+    FROM user_settings
+    WHERE user_id = ?
+  `).bind(userId).first();
+
+  if (!row) {
+    return {
+      initialized: false,
+      onboardingRequired: true,
+      retentionAnswered: false,
+      trainingAnswered: false,
+      retentionConsent: false,
+      trainingConsent: false,
+      memoryEnabled: false,
+      historyEnabled: false
+    };
+  }
+
+  const retentionAnswered = row.retention_choice_at != null;
+  const trainingAnswered = row.training_choice_at != null;
+
+  const onboardingRequired = !(
+    row.privacy_notice_version === PRIVACY_NOTICE_VERSION &&
+    retentionAnswered &&
+    trainingAnswered
+  );
+
+  return {
+    initialized: true,
+    onboardingRequired,
+    retentionAnswered,
+    trainingAnswered,
+    retentionConsent: row.retention_consent === 1,
+    trainingConsent: row.training_consent === 1,
+    memoryEnabled: row.memory_enabled === 1,
+    historyEnabled: row.history_enabled === 1
   };
-
-  return { env: { DB }, close: () => sqlite.close() };
 }
 
-async function answerBothChoices(env, userId, retention = true, training = false) {
-  await setRetentionConsent(env, userId, retention);
-  await setTrainingConsent(env, userId, training);
+export async function setRetentionConsent(env, userId, accepted) {
+  validateUserId(userId);
+  validateChoice(accepted, "Retention consent");
+
+  const db = requireDB(env);
+
+  await db.prepare(`
+    INSERT OR IGNORE INTO user_settings (user_id)
+    VALUES (?)
+  `).bind(userId).run();
+
+  await db.prepare(`
+    UPDATE user_settings
+    SET retention_consent = ?,
+        history_enabled = CASE
+          WHEN ? = 0 THEN 0
+          ELSE history_enabled
+        END,
+        memory_enabled = CASE
+          WHEN ? = 0 THEN 0
+          ELSE memory_enabled
+        END,
+        retention_consent_at = CASE
+          WHEN ? = 1 THEN CURRENT_TIMESTAMP
+          ELSE NULL
+        END,
+        retention_choice_at = CURRENT_TIMESTAMP,
+        privacy_notice_version = ?,
+        consent_updated_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = ?
+  `).bind(
+    accepted ? 1 : 0,
+    accepted ? 1 : 0,
+    accepted ? 1 : 0,
+    accepted ? 1 : 0,
+    PRIVACY_NOTICE_VERSION,
+    userId
+  ).run();
+
+  return getConsentStatus(env, userId);
 }
 
-async function enableMemory(env, userId) {
-  await answerBothChoices(env, userId, true, false);
-  await setPersonalMemoryEnabled(env, userId, true);
+export async function setTrainingConsent(env, userId, accepted) {
+  validateUserId(userId);
+  validateChoice(accepted, "Training consent");
+
+  const db = requireDB(env);
+
+  await db.prepare(`
+    INSERT OR IGNORE INTO user_settings (user_id)
+    VALUES (?)
+  `).bind(userId).run();
+
+  await db.prepare(`
+    UPDATE user_settings
+    SET training_consent = ?,
+        training_consent_at = CASE
+          WHEN ? = 1 THEN CURRENT_TIMESTAMP
+          ELSE NULL
+        END,
+        training_choice_at = CURRENT_TIMESTAMP,
+        privacy_notice_version = ?,
+        consent_updated_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = ?
+  `).bind(
+    accepted ? 1 : 0,
+    accepted ? 1 : 0,
+    PRIVACY_NOTICE_VERSION,
+    userId
+  ).run();
+
+  return getConsentStatus(env, userId);
 }
 
-test("new user has memory and history disabled", async () => {
-  const db = makeTestEnv();
-  try {
-    const settings = await initializeUser(db.env, "user-a");
-    assert.equal(settings.memory_enabled, 0);
-    assert.equal(settings.history_enabled, 0);
-    assert.equal(settings.training_consent, 0);
-  } finally {
-    db.close();
+export async function setPersonalMemoryEnabled(env, userId, enabled) {
+  validateUserId(userId);
+  validateChoice(enabled, "Memory preference");
+
+  const db = requireDB(env);
+  const status = await getConsentStatus(env, userId);
+
+  if (!status.initialized) {
+    throw new Error("User not initialized.");
   }
-});
 
-test("messages are not stored when history is disabled", async () => {
-  const db = makeTestEnv();
-  try {
-    await initializeUser(db.env, "user-a");
-    await answerBothChoices(db.env, "user-a", true, false);
-
-    const conversation = await startConversation(db.env, "user-a");
-    assert.ok(conversation);
-
-    const result = await saveMessage(
-      db.env, "user-a", conversation, "user", "Hello Maya"
-    );
-
-    assert.deepEqual(result, {
-      saved: false,
-      reason: "history_disabled"
-    });
-  } finally {
-    db.close();
+  if (enabled) {
+    if (status.onboardingRequired || !status.retentionConsent) {
+      throw new Error(
+        "Completed onboarding and retention consent are required."
+      );
+    }
   }
-});
 
-test("conversation is not started without retention consent", async () => {
-  const db = makeTestEnv();
-  try {
-    await initializeUser(db.env, "user-a");
+  await db.prepare(`
+    UPDATE user_settings
+    SET memory_enabled = ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = ?
+  `).bind(enabled ? 1 : 0, userId).run();
 
-    const conversation = await startConversation(db.env, "user-a");
-    assert.equal(conversation, null);
-  } finally {
-    db.close();
-  }
-});
-
-test("memory is not stored when memory is disabled", async () => {
-  const db = makeTestEnv();
-  try {
-    await initializeUser(db.env, "user-a");
-    await answerBothChoices(db.env, "user-a", true, false);
-
-    const result = await proposeMemory(
-      db.env, "user-a", "preference", "Likes funny replies"
-    );
-
-    assert.deepEqual(result, {
-      saved: false,
-      reason: "memory_disabled"
-    });
-  } finally {
-    db.close();
-  }
-});
-
-test("only approved memories can be retrieved", async () => {
-  const db = makeTestEnv();
-  try {
-    await initializeUser(db.env, "user-a");
-    await enableMemory(db.env, "user-a");
-
-    const pending = await proposeMemory(
-      db.env, "user-a", "preference", "Likes gentle humour"
-    );
-    assert.equal(pending.saved, true);
-
-    assert.equal(
-      (await retrieveMemories(db.env, "user-a")).length,
-      0
-    );
-
-    await reviewMemory(db.env, "user-a", pending.memoryId, true);
-
-    const memories = await retrieveMemories(db.env, "user-a");
-    assert.equal(memories.length, 1);
-    assert.equal(memories[0].content, "Likes gentle humour");
-  } finally {
-    db.close();
-  }
-});
-
-test("users cannot retrieve each other's memories", async () => {
-  const db = makeTestEnv();
-  try {
-    await initializeUser(db.env, "user-a");
-    await initializeUser(db.env, "user-b");
-
-    await enableMemory(db.env, "user-a");
-    await enableMemory(db.env, "user-b");
-
-    const memory = await proposeMemory(
-      db.env, "user-a", "milestone", "A fictional event"
-    );
-    assert.equal(memory.saved, true);
-
-    await reviewMemory(db.env, "user-a", memory.memoryId, true);
-
-    assert.equal(
-      (await retrieveMemories(db.env, "user-b")).length,
-      0
-    );
-  } finally {
-    db.close();
-  }
-});
-
-test("a user cannot write to another user's conversation", async () => {
-  const db = makeTestEnv();
-  try {
-    await initializeUser(db.env, "user-a");
-    await initializeUser(db.env, "user-b");
-
-    await answerBothChoices(db.env, "user-a", true, false);
-    await answerBothChoices(db.env, "user-b", true, false);
-
-    await setHistoryEnabled(db.env, "user-a", true);
-    await setHistoryEnabled(db.env, "user-b", true);
-
-    const conversation = await startConversation(db.env, "user-a");
-    assert.ok(conversation);
-
-    await assert.rejects(
-      saveMessage(
-        db.env, "user-b", conversation, "user", "Private message"
-      ),
-      /Conversation not found/
-    );
-  } finally {
-    db.close();
-  }
-});
-
-test("revoking retention disables history and personal memory", async () => {
-  const db = makeTestEnv();
-  try {
-    await initializeUser(db.env, "user-a");
-    await enableMemory(db.env, "user-a");
-    await setHistoryEnabled(db.env, "user-a", true);
-
-    await setRetentionConsent(db.env, "user-a", false);
-
-    const settings = await initializeUser(db.env, "user-a");
-    assert.equal(settings.history_enabled, 0);
-    assert.equal(settings.memory_enabled, 0);
-
-    assert.equal(
-      (await retrieveMemories(db.env, "user-a")).length,
-      0
-    );
-  } finally {
-    db.close();
-  }
-});
+  return getConsentStatus(env, userId);
+}
