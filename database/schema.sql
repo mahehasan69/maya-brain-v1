@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS user_settings (
         CHECK (retention_consent IN (0, 1)),
     privacy_notice_version TEXT,
     retention_consent_at TEXT,
+    retention_choice_at TEXT,
+    training_choice_at TEXT,
     training_consent_at TEXT,
     consent_updated_at TEXT,
     retention_days INTEGER,
