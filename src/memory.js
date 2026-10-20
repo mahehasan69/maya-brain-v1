@@ -1,22 +1,5 @@
 
-function requireDB(env) {
-  if (!env?.DB) {
-    throw new Error("Memory module: DB binding is missing.");
-  }
-  return env.DB;
-}
-
-function validateUserId(userId) {
-  if (typeof userId !== "string" || !userId.trim()) {
-    throw new Error("A valid internal user ID is required.");
-  }
-}
-
-function validateBoolean(value, name) {
-  if (typeof value !== "boolean") {
-    throw new Error(`${name} must be true or false.`);
-  }
-}
+const PRIVACY_NOTICE_VERSION = "1.0";
 
 const ALLOWED_MEMORY_CATEGORIES = [
   "preference",
@@ -25,6 +8,29 @@ const ALLOWED_MEMORY_CATEGORIES = [
   "interest",
   "important_event"
 ];
+
+function requireDB(env) {
+  if (!env?.DB) {
+    throw new Error("Database binding is missing.");
+  }
+  return env.DB;
+}
+
+function validateUserId(userId) {
+  if (
+    typeof userId !== "string" ||
+    !userId.trim() ||
+    userId.length > 200
+  ) {
+    throw new Error("A valid user ID is required.");
+  }
+}
+
+function validateBoolean(value, name) {
+  if (typeof value !== "boolean") {
+    throw new Error(`${name} must be true or false.`);
+  }
+}
 
 async function getSettingsRow(db, userId) {
   return db.prepare(`
@@ -40,7 +46,7 @@ async function getSettingsRow(db, userId) {
 function onboardingComplete(row) {
   return Boolean(
     row &&
-    row.privacy_notice_version === "1.0" &&
+    row.privacy_notice_version === PRIVACY_NOTICE_VERSION &&
     row.retention_choice_at != null &&
     row.training_choice_at != null
   );
@@ -71,14 +77,12 @@ async function requireRetentionConsent(db, userId) {
 
 export async function initializeUser(env, userId) {
   validateUserId(userId);
-  const db = requireDB(env);
-  return ensureUser(db, userId);
+  return ensureUser(requireDB(env), userId);
 }
 
 /**
- * Records explicit onboarding choices.
- * History and long-term memory remain disabled by default.
- * Training consent is independent of retention consent.
+ * Record the user's separate retention and training choices.
+ * History and long-term memory remain disabled until enabled separately.
  */
 export async function recordConsent(
   env,
@@ -99,7 +103,7 @@ export async function recordConsent(
     UPDATE user_settings
     SET retention_consent = ?,
         training_consent = ?,
-        privacy_notice_version = '1.0',
+        privacy_notice_version = ?,
         retention_choice_at = ?,
         training_choice_at = ?,
         retention_consent_at = ?,
@@ -112,10 +116,11 @@ export async function recordConsent(
   `).bind(
     retentionConsent ? 1 : 0,
     trainingConsent ? 1 : 0,
+    PRIVACY_NOTICE_VERSION,
     now,
     now,
-    now,
-    now,
+    retentionConsent ? now : null,
+    trainingConsent ? now : null,
     now,
     userId
   ).run();
@@ -123,9 +128,60 @@ export async function recordConsent(
   return getSettingsRow(db, userId);
 }
 
+export async function startConversation(env, userId) {
+  validateUserId(userId);
+
+  const db = requireDB(env);
+  await ensureUser(db, userId);
+
+  const permission = await requireRetentionConsent(db, userId);
+
+  if (!permission.allowed) {
+    return null;
+  }
+
+  const conversationId = crypto.randomUUID();
+
+  await db.prepare(`
+    INSERT INTO conversations (conversation_id, user_id)
+    VALUES (?, ?)
+  `).bind(conversationId, userId).run();
+
+  return conversationId;
+}
+
+export async function setHistoryEnabled(env, userId, enabled) {
+  validateUserId(userId);
+  validateBoolean(enabled, "History setting");
+
+  const db = requireDB(env);
+  const row = await getSettingsRow(db, userId);
+
+  if (!row) {
+    throw new Error("User not initialized.");
+  }
+
+  if (enabled) {
+    const permission = await requireRetentionConsent(db, userId);
+
+    if (!permission.allowed) {
+      throw new Error("Current retention consent is required.");
+    }
+  }
+
+  await db.prepare(`
+    UPDATE user_settings
+    SET history_enabled = ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = ?
+  `).bind(enabled ? 1 : 0, userId).run();
+
+  return getSettingsRow(db, userId);
+}
+
 export async function setMemoryEnabled(env, userId, enabled) {
   validateUserId(userId);
-  validateBoolean(enabled, "Memory preference");
+  validateBoolean(enabled, "Memory setting");
 
   const db = requireDB(env);
   const row = await getSettingsRow(db, userId);
@@ -154,57 +210,6 @@ export async function setMemoryEnabled(env, userId, enabled) {
   return getSettingsRow(db, userId);
 }
 
-export async function setHistoryEnabled(env, userId, enabled) {
-  validateUserId(userId);
-  validateBoolean(enabled, "History preference");
-
-  const db = requireDB(env);
-  const row = await getSettingsRow(db, userId);
-
-  if (!row) {
-    throw new Error("User not initialized.");
-  }
-
-  if (enabled) {
-    const permission = await requireRetentionConsent(db, userId);
-
-    if (!permission.allowed) {
-      throw new Error("Current retention consent is required.");
-    }
-  }
-
-  await db.prepare(`
-    UPDATE user_settings
-    SET history_enabled = ?,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE user_id = ?
-  `).bind(enabled ? 1 : 0, userId).run();
-
-  return getSettingsRow(db, userId);
-}
-
-export async function startConversation(env, userId) {
-  validateUserId(userId);
-
-  const db = requireDB(env);
-  await ensureUser(db, userId);
-
-  const permission = await requireRetentionConsent(db, userId);
-
-  if (!permission.allowed) {
-    return null;
-  }
-
-  const conversationId = crypto.randomUUID();
-
-  await db.prepare(`
-    INSERT INTO conversations (conversation_id, user_id)
-    VALUES (?, ?)
-  `).bind(conversationId, userId).run();
-
-  return conversationId;
-}
-
 export async function saveMessage(
   env,
   userId,
@@ -216,7 +221,8 @@ export async function saveMessage(
 
   if (
     typeof conversationId !== "string" ||
-    !conversationId.trim()
+    !conversationId.trim() ||
+    conversationId.length > 200
   ) {
     throw new Error("A valid conversation ID is required.");
   }
@@ -226,24 +232,18 @@ export async function saveMessage(
   }
 
   if (typeof content !== "string" || !content.trim()) {
-    throw new Error("Message content must be a non-empty string.");
+    throw new Error("Message content is required.");
   }
 
   const db = requireDB(env);
   const permission = await requireRetentionConsent(db, userId);
 
   if (!permission.allowed) {
-    return {
-      saved: false,
-      reason: "retention_consent_required"
-    };
+    return { saved: false, reason: "consent_required" };
   }
 
   if (permission.row.history_enabled !== 1) {
-    return {
-      saved: false,
-      reason: "history_disabled"
-    };
+    return { saved: false, reason: "history_disabled" };
   }
 
   const conversation = await db.prepare(`
@@ -273,41 +273,34 @@ export async function proposeMemory(
 ) {
   validateUserId(userId);
 
-  if (
-    typeof category !== "string" ||
-    !ALLOWED_MEMORY_CATEGORIES.includes(category)
-  ) {
-    throw new Error("Unsupported memory category");
+  if (!ALLOWED_MEMORY_CATEGORIES.includes(category)) {
+    throw new Error("Unsupported memory category.");
   }
 
-  if (typeof content !== "string" || !content.trim()) {
-    throw new Error("Memory content must be a non-empty string.");
+  if (
+    typeof content !== "string" ||
+    !content.trim() ||
+    content.length > 1000
+  ) {
+    throw new Error("Memory content must be 1–1000 characters.");
   }
 
   if (
     sourceMessageId !== null &&
     (!Number.isInteger(sourceMessageId) || sourceMessageId < 1)
   ) {
-    throw new Error(
-      "Source message ID must be a positive integer or null."
-    );
+    throw new Error("Invalid source message ID.");
   }
 
   const db = requireDB(env);
   const permission = await requireRetentionConsent(db, userId);
 
   if (!permission.allowed) {
-    return {
-      saved: false,
-      reason: "retention_consent_required"
-    };
+    return { saved: false, reason: "consent_required" };
   }
 
   if (permission.row.memory_enabled !== 1) {
-    return {
-      saved: false,
-      reason: "memory_disabled"
-    };
+    return { saved: false, reason: "memory_disabled" };
   }
 
   if (sourceMessageId !== null) {
@@ -328,12 +321,8 @@ export async function proposeMemory(
 
   await db.prepare(`
     INSERT INTO memories (
-      memory_id,
-      user_id,
-      category,
-      content,
-      source_message_id,
-      review_status
+      memory_id, user_id, category, content,
+      source_message_id, review_status
     )
     VALUES (?, ?, ?, ?, ?, 'pending')
   `).bind(
@@ -375,14 +364,9 @@ export async function reviewMemory(
     userId
   ).run();
 
-  if (!result.meta?.changes) {
-    return {
-      updated: false,
-      reason: "memory_not_found_or_already_reviewed"
-    };
-  }
-
-  return { updated: true };
+  return {
+    updated: (result.meta?.changes ?? 0) > 0
+  };
 }
 
 export async function retrieveMemories(
@@ -394,14 +378,14 @@ export async function retrieveMemories(
   validateUserId(userId);
 
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-    throw new Error("Memory limit must be an integer from 1 to 100.");
+    throw new Error("Limit must be between 1 and 100.");
   }
 
   if (
     category !== null &&
-    (typeof category !== "string" || !category.trim())
+    !ALLOWED_MEMORY_CATEGORIES.includes(category)
   ) {
-    throw new Error("Category must be a non-empty string or null.");
+    throw new Error("Unsupported memory category.");
   }
 
   const db = requireDB(env);
@@ -411,7 +395,7 @@ export async function retrieveMemories(
     return [];
   }
 
-  const query = category === null
+  const statement = category === null
     ? db.prepare(`
         SELECT memory_id, category, content, confidence, created_at
         FROM memories
@@ -432,6 +416,6 @@ export async function retrieveMemories(
         LIMIT ?
       `).bind(userId, category, limit);
 
-  const result = await query.all();
+  const result = await statement.all();
   return result.results ?? [];
 }
