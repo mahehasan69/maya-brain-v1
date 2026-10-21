@@ -1,431 +1,389 @@
 
-import { generateReply } from "./reply.js";
-import {
-  initializeUser,
-  recordConsent,
-  startConversation,
-  setHistoryEnabled,
-  setMemoryEnabled,
-  proposeMemory,
-  reviewMemory,
-  retrieveMemories
-} from "./memory.js";
+const BRAIN_URL = "https://maya-brain-v1.mahehassan69.workers.dev";
 
-const ALLOWED_ORIGIN = "http://127.0.0.1:8000";
-const MAX_USER_ID_LENGTH = 200;
-const MAX_CONVERSATION_ID_LENGTH = 200;
-const MAX_MESSAGE_LENGTH = 12000;
-const MAX_MEMORY_CONTENT_LENGTH = 1000;
-
-function corsHeaders(request) {
-  const origin = request.headers.get("Origin");
-  const headers = new Headers({
-    "Cache-Control": "no-store",
-    "Vary": "Origin"
-  });
-
-  if (origin === ALLOWED_ORIGIN) {
-    headers.set("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-    headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-    headers.set(
-      "Access-Control-Allow-Headers",
-      "Authorization, Content-Type"
-    );
-    headers.set("Access-Control-Max-Age", "600");
-  }
-
-  return headers;
-}
-
-function jsonResponse(data, status = 200, request) {
-  const headers = corsHeaders(request);
-  headers.set("Content-Type", "application/json; charset=utf-8");
-
-  return new Response(JSON.stringify(data), {
+const json = (data, status = 200) =>
+  new Response(JSON.stringify(data), {
     status,
-    headers
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store"
+    }
   });
-}
-
-function isAuthorized(request, env) {
-  const secret = env?.BRAIN_API_SECRET;
-  const authorization = request.headers.get("Authorization");
-
-  return (
-    typeof secret === "string" &&
-    secret.length >= 32 &&
-    authorization === `Bearer ${secret}`
-  );
-}
-
-async function readJson(request) {
-  try {
-    return {
-      ok: true,
-      body: await request.json()
-    };
-  } catch {
-    return { ok: false };
-  }
-}
-
-function validUserId(userId) {
-  return (
-    typeof userId === "string" &&
-    userId.trim().length > 0 &&
-    userId.length <= MAX_USER_ID_LENGTH
-  );
-}
-
-function validConversationId(conversationId) {
-  return (
-    typeof conversationId === "string" &&
-    conversationId.trim().length > 0 &&
-    conversationId.length <= MAX_CONVERSATION_ID_LENGTH
-  );
-}
-
-function databaseAvailable(env) {
-  return Boolean(env?.DB);
-}
-
-function memoryErrorResponse(request) {
-  return jsonResponse(
-    { error: "Unable to complete the memory operation" },
-    500,
-    request
-  );
-}
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const origin = request.headers.get("Origin");
-    const path = url.pathname;
 
-    // Allow only the configured local browser tester.
-    // Server-to-server calls without an Origin are supported.
-    if (origin && origin !== ALLOWED_ORIGIN) {
-      return jsonResponse({ error: "Origin not allowed" }, 403, request);
-    }
-
-    if (request.method === "GET" && path === "/health") {
-      return jsonResponse({
+    if (
+      request.method === "GET" &&
+      (url.pathname === "/" || url.pathname === "/health")
+    ) {
+      return json({
         ok: true,
-        service: "maya-brain-v1",
+        service: "maya-brain-telegram-test",
         status: "online"
-      }, 200, request);
-    }
-
-    const allowedPaths = [
-      "/onboarding",
-      "/reply",
-      "/settings/history",
-      "/memory/test",
-      "/memory/enable",
-      "/memory/approve",
-      "/memory/retrieve"
-    ];
-
-    if (!allowedPaths.includes(path)) {
-      return jsonResponse({ error: "Not found" }, 404, request);
-    }
-
-    if (request.method === "OPTIONS") {
-      if (origin !== ALLOWED_ORIGIN) {
-        return jsonResponse({ error: "Origin not allowed" }, 403, request);
-      }
-
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders(request)
       });
     }
 
-    if (request.method !== "POST") {
-      return jsonResponse({ error: "Method not allowed" }, 405, request);
-    }
-
-    if (!isAuthorized(request, env)) {
-      return jsonResponse({ error: "Unauthorized" }, 401, request);
-    }
-
-    const parsed = await readJson(request);
-
-    if (!parsed.ok) {
-      return jsonResponse({ error: "Invalid JSON body" }, 400, request);
-    }
-
-    const body = parsed.body ?? {};
-
-    if (!databaseAvailable(env)) {
-      return jsonResponse(
-        { error: "Service configuration error" },
-        503,
-        request
-      );
-    }
-
-    // Explicit onboarding choices and conversation initialization.
-    if (path === "/onboarding") {
-      const { userId, retentionConsent, trainingConsent } = body;
-
+    if (request.method === "POST" && url.pathname === "/setup") {
       if (
-        !validUserId(userId) ||
-        typeof retentionConsent !== "boolean" ||
-        typeof trainingConsent !== "boolean"
+        !env.WEBHOOK_SETUP_KEY ||
+        request.headers.get("X-Setup-Key") !== env.WEBHOOK_SETUP_KEY
       ) {
-        return jsonResponse({
-          error:
-            "userId, boolean retentionConsent, and boolean trainingConsent are required"
-        }, 400, request);
+        return json({ error: "Unauthorized" }, 401);
+      }
+
+      if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_WEBHOOK_SECRET) {
+        return json(
+          { error: "Telegram configuration is incomplete" },
+          503
+        );
       }
 
       try {
-        await initializeUser(env, userId);
+        const result = await telegram(env, "setWebhook", {
+          url: `${url.origin}/telegram`,
+          secret_token: env.TELEGRAM_WEBHOOK_SECRET,
+          allowed_updates: ["message"],
+          drop_pending_updates: false
+        });
 
-        const settings = await recordConsent(
-          env,
-          userId,
-          retentionConsent,
-          trainingConsent
-        );
-
-        let conversationId = null;
-
-        if (retentionConsent) {
-          conversationId = await startConversation(env, userId);
-
-          if (!conversationId) {
-            return jsonResponse({
-              error: "Consent saved, but conversation setup failed"
-            }, 500, request);
-          }
-        }
-
-        return jsonResponse({
-          ok: true,
-          userId,
-          retentionConsent: settings.retention_consent === 1,
-          trainingConsent: settings.training_consent === 1,
-          conversationId
-        }, 200, request);
-      } catch {
-        return jsonResponse(
-          { error: "Unable to complete onboarding" },
-          500,
-          request
-        );
-      }
-    }
-
-    // Update conversation history setting.
-    if (path === "/settings/history") {
-      const { userId, enabled } = body;
-
-      if (!validUserId(userId) || typeof enabled !== "boolean") {
-        return jsonResponse({
-          error: "userId and boolean enabled are required"
-        }, 400, request);
-      }
-
-      try {
-        const settings = await setHistoryEnabled(env, userId, enabled);
-
-        return jsonResponse({
-          ok: true,
-          userId,
-          history_enabled: settings.history_enabled === 1
-        }, 200, request);
+        return json({ ok: true, webhook: result });
       } catch (error) {
-        const message = error instanceof Error ? error.message : "";
+        console.error(
+          "Webhook setup failed:",
+          String(error?.message || "Unknown error")
+        );
 
-        if (
-          message === "User not initialized." ||
-          message === "Current retention consent is required."
-        ) {
-          return jsonResponse({ error: message }, 400, request);
-        }
-
-        return jsonResponse(
-          { error: "Unable to update history settings" },
-          500,
-          request
+        return json(
+          { error: "Unable to configure Telegram webhook" },
+          502
         );
       }
     }
 
-    // Enable or disable long-term memory.
-    if (path === "/memory/enable") {
-      const { userId, enabled } = body;
+    if (request.method === "POST" && url.pathname === "/telegram") {
+      const missing = [];
 
-      if (!validUserId(userId) || typeof enabled !== "boolean") {
-        return jsonResponse({
-          error: "userId and boolean enabled are required"
-        }, 400, request);
+      if (!env.TELEGRAM_BOT_TOKEN) missing.push("TELEGRAM_BOT_TOKEN");
+      if (!env.TELEGRAM_WEBHOOK_SECRET) {
+        missing.push("TELEGRAM_WEBHOOK_SECRET");
+      }
+      if (!env.BRAIN_API_SECRET) missing.push("BRAIN_API_SECRET");
+      if (!env.TEST_STATE) missing.push("TEST_STATE");
+      if (!env.TEST_OWNER_TELEGRAM_ID) {
+        missing.push("TEST_OWNER_TELEGRAM_ID");
+      }
+
+      if (missing.length) {
+        console.error(
+          "Missing Worker configuration:",
+          missing.join(", ")
+        );
+
+        return json(
+          { error: "Worker configuration is incomplete" },
+          503
+        );
+      }
+
+      if (
+        request.headers.get("X-Telegram-Bot-Api-Secret-Token") !==
+        env.TELEGRAM_WEBHOOK_SECRET
+      ) {
+        console.error("Telegram webhook secret validation failed");
+        return json({ error: "Unauthorized" }, 401);
+      }
+
+      let update;
+
+      try {
+        update = await request.json();
+      } catch {
+        return json({ error: "Invalid JSON" }, 400);
       }
 
       try {
-        const settings = await setMemoryEnabled(env, userId, enabled);
-
-        return jsonResponse({
-          ok: true,
-          userId,
-          memory_enabled: settings.memory_enabled === 1
-        }, 200, request);
+        await handleUpdate(update, env);
       } catch (error) {
-        const message = error instanceof Error ? error.message : "";
-
-        if (
-          message === "User not initialized." ||
-          message === "Current onboarding and retention consent are required."
-        ) {
-          return jsonResponse({ error: message }, 400, request);
-        }
-
-        return jsonResponse(
-          { error: "Unable to update memory settings" },
-          500,
-          request
+        console.error(
+          "Telegram update handling failed:",
+          String(error?.message || "Unknown error")
         );
       }
+
+      // Telegram must receive a successful acknowledgement.
+      return json({ ok: true });
     }
 
-    // Test the memory consent safeguards.
-    if (path === "/memory/test") {
-      const { userId, content } = body;
-
-      if (
-        !validUserId(userId) ||
-        typeof content !== "string" ||
-        !content.trim() ||
-        content.length > MAX_MEMORY_CONTENT_LENGTH
-      ) {
-        return jsonResponse({
-          error: "Valid userId and content (maximum 1000 characters) are required"
-        }, 400, request);
-      }
-
-      try {
-        const result = await proposeMemory(
-          env,
-          userId,
-          "preference",
-          content
-        );
-
-        return jsonResponse({
-          ok: true,
-          test: "memory-consent-protection",
-          result
-        }, 200, request);
-      } catch {
-        return memoryErrorResponse(request);
-      }
-    }
-
-    // Approve a pending memory for the specified user.
-    if (path === "/memory/approve") {
-      const { userId, memoryId } = body;
-
-      if (
-        !validUserId(userId) ||
-        typeof memoryId !== "string" ||
-        !memoryId.trim() ||
-        memoryId.length > 200
-      ) {
-        return jsonResponse({
-          error: "Valid userId and memoryId are required"
-        }, 400, request);
-      }
-
-      try {
-        const result = await reviewMemory(
-          env,
-          userId,
-          memoryId,
-          true
-        );
-
-        return jsonResponse({ ok: true, result }, 200, request);
-      } catch {
-        return memoryErrorResponse(request);
-      }
-    }
-
-    // Retrieve approved, unexpired memories.
-    if (path === "/memory/retrieve") {
-      const { userId } = body;
-
-      if (!validUserId(userId)) {
-        return jsonResponse({
-          error: "A valid userId is required"
-        }, 400, request);
-      }
-
-      try {
-        const memories = await retrieveMemories(
-          env,
-          userId,
-          null,
-          10
-        );
-
-        return jsonResponse({
-          ok: true,
-          count: memories.length,
-          memories
-        }, 200, request);
-      } catch {
-        return memoryErrorResponse(request);
-      }
-    }
-
-    // Generate a reply.
-    if (!env.GROQ_API_KEY) {
-      return jsonResponse(
-        { error: "AI provider is not configured" },
-        503,
-        request
-      );
-    }
-
-    const { userId, conversationId, message } = body;
-
-    if (
-      !validUserId(userId) ||
-      !validConversationId(conversationId) ||
-      typeof message !== "string" ||
-      !message.trim()
-    ) {
-      return jsonResponse({
-        error: "Valid userId, conversationId, and message are required"
-      }, 400, request);
-    }
-
-    if (message.length > MAX_MESSAGE_LENGTH) {
-      return jsonResponse({
-        error: "Message exceeds the 12000-character limit"
-      }, 413, request);
-    }
-
-    try {
-      const reply = await generateReply(
-        env,
-        userId,
-        conversationId,
-        message
-      );
-
-      return jsonResponse({ ok: true, reply }, 200, request);
-    } catch {
-      return jsonResponse(
-        { error: "Unable to generate a reply right now" },
-        502,
-        request
-      );
-    }
+    return json({ error: "Not found" }, 404);
   }
 };
 
+async function telegram(env, method, payload) {
+  const response = await fetch(
+    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }
+  );
 
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || !data.ok) {
+    throw new Error(
+      `Telegram ${method} failed with HTTP ${response.status}`
+    );
+  }
+
+  return data.result;
+}
+
+async function sendText(env, chatId, text) {
+  return telegram(env, "sendMessage", {
+    chat_id: chatId,
+    text: String(text).slice(0, 4000)
+  });
+}
+
+async function callBrain(env, path, body) {
+  const base = BRAIN_URL.replace(/\/+$/, "");
+  const cleanPath = path.replace(/^\/+/, "");
+  const url = `${base}/${cleanPath}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.BRAIN_API_SECRET}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  const raw = await response.text();
+
+  let data = {};
+
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    // The API can return plain-text errors.
+  }
+
+  if (!response.ok || data.ok !== true) {
+    console.error("Brain API request failed:", {
+      url,
+      status: response.status,
+      contentType: response.headers.get("content-type"),
+      responsePreview: raw.slice(0, 300)
+    });
+
+    throw new Error(`Brain API request failed: HTTP ${response.status}`);
+  }
+
+  return data;
+}
+
+function stateKey(telegramId) {
+  return `maya-test-user:${telegramId}`;
+}
+
+async function getState(env, telegramId) {
+  const raw = await env.TEST_STATE.get(stateKey(telegramId));
+
+  if (!raw) return null;
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function handleUpdate(update, env) {
+  const message = update?.message;
+
+  if (!message || message.chat?.type !== "private") return;
+  if (typeof message.text !== "string") return;
+  if (!message.from || !message.chat?.id) return;
+
+  const telegramId = String(message.from.id);
+
+  if (telegramId !== String(env.TEST_OWNER_TELEGRAM_ID)) {
+    console.warn("Ignored message from an unconfigured Telegram user");
+    return;
+  }
+
+  const chatId = message.chat.id;
+  const text = message.text.trim();
+  const command = text.split(/\s+/)[0].split("@")[0].toLowerCase();
+  const userId = `maya-telegram-test:${telegramId}`;
+
+  if (command === "/start") {
+    await sendText(
+      env,
+      chatId,
+      "Hi! This is the private Maya Brain test bot.\n\n" +
+        "Before chatting, choose whether you allow message retention.\n\n" +
+        "• /consent — allow message retention and conversation history for this test. AI-training consent remains NO.\n" +
+        "• /no — withdraw retention consent and stop using the bot.\n\n" +
+        "Long-term memory remains disabled. Previously stored data is not automatically deleted by /no."
+    );
+    return;
+  }
+
+  if (command === "/no") {
+    try {
+      // Withdraw consent first; this also disables history and memory.
+      await callBrain(env, "/onboarding", {
+        userId,
+        retentionConsent: false,
+        trainingConsent: false
+      });
+
+      await env.TEST_STATE.delete(stateKey(telegramId));
+
+      await sendText(
+        env,
+        chatId,
+        "Retention consent has been withdrawn. History and long-term memory are disabled. Previously stored messages have not been deleted."
+      );
+    } catch (error) {
+      console.error(
+        "Consent withdrawal failed:",
+        String(error?.message || "Unknown error")
+      );
+
+      await sendText(
+        env,
+        chatId,
+        "I couldn't update your consent right now. Please try /no again later."
+      );
+    }
+    return;
+  }
+
+  if (command === "/consent") {
+    let stage = "onboarding";
+
+    try {
+      // 1. Record explicit consent.
+      const result = await callBrain(env, "/onboarding", {
+        userId,
+        retentionConsent: true,
+        trainingConsent: false
+      });
+
+      if (
+        typeof result.conversationId !== "string" ||
+        !result.conversationId
+      ) {
+        throw new Error("Conversation ID missing from Brain response");
+      }
+
+      // 2. Enable history only after consent is recorded.
+      stage = "enable_history";
+
+      const historyResult = await callBrain(
+        env,
+        "/settings/history",
+        {
+          userId,
+          enabled: true
+        }
+      );
+
+      if (historyResult.history_enabled !== true) {
+        throw new Error("Conversation history could not be enabled");
+      }
+
+      // 3. Persist test state in KV.
+      stage = "kv_write";
+
+      await env.TEST_STATE.put(
+        stateKey(telegramId),
+        JSON.stringify({
+          consented: true,
+          conversationId: result.conversationId
+        })
+      );
+
+      // 4. Confirm to the user.
+      stage = "telegram_reply";
+
+      await sendText(
+        env,
+        chatId,
+        "Consent saved! Conversation history is enabled, so messages and replies can be saved in the Brain database. AI-training consent is NO, and long-term memory remains disabled. You can now chat with Maya."
+      );
+    } catch (error) {
+      console.error(
+        "Consent setup failed at:",
+        stage,
+        "Error:",
+        String(error?.message || "Unknown error")
+      );
+
+      try {
+        await sendText(
+          env,
+          chatId,
+          `Setup failed at ${stage}. Please check the test Worker's logs.`
+        );
+      } catch (sendError) {
+        console.error(
+          "Could not send consent error message:",
+          String(sendError?.message || "Unknown error")
+        );
+      }
+    }
+    return;
+  }
+
+  if (command.startsWith("/")) {
+    await sendText(
+      env,
+      chatId,
+      "Commands:\n/start — show information\n/consent — enable retention and conversation history\n/no — withdraw retention consent"
+    );
+    return;
+  }
+
+  const state = await getState(env, telegramId);
+
+  if (!state?.consented || !state?.conversationId) {
+    await sendText(
+      env,
+      chatId,
+      "Please read the information using /start, then send /consent if you agree."
+    );
+    return;
+  }
+
+  try {
+    const result = await callBrain(env, "/reply", {
+      userId,
+      conversationId: state.conversationId,
+      message: text
+    });
+
+    if (typeof result.reply !== "string" || !result.reply.trim()) {
+      throw new Error("Brain returned an empty reply");
+    }
+
+    await sendText(env, chatId, result.reply);
+  } catch (error) {
+    console.error(
+      "Brain reply failed:",
+      String(error?.message || "Unknown error")
+    );
+
+    await sendText(
+      env,
+      chatId,
+      "Maya Brain couldn't generate a reply right now. Please try again shortly."
+    );
+  }
+}
